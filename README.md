@@ -1,36 +1,24 @@
 # Rsbuild project
 
+make sure you’re in the root directory (girlies folder)
+
 ## Setup
 
 Install the dependencies:
 
 ```bash
-pnpm install
+pip install -r requirements.txt
 ```
 
-## Get started
-
-Start the dev server, and the app will be available at [http://localhost:3000](http://localhost:3000).
+## Start Client
 
 ```bash
-pnpm dev
+npm run dev
 ```
 
-Build the app for production:
+## Start Server
 
 ```bash
-pnpm build
+cd backend
+python app.py
 ```
-
-Preview the production build locally:
-
-```bash
-pnpm preview
-```
-
-## Learn more
-
-To learn more about Rsbuild, check out the following resources:
-
-- [Rsbuild documentation](https://rsbuild.rs) - explore Rsbuild features and APIs.
-- [Rsbuild GitHub repository](https://github.com/web-infra-dev/rsbuild) - your feedback and contributions are welcome!
