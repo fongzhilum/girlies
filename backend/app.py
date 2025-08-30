@@ -1,209 +1,341 @@
+# app.py - Updated with Natural Decision Boundary (matches notebook exactly)
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import os, io, time
+import numpy as np
 import pandas as pd
-import io, re, math, time
+from typing import Optional, Dict, List
+from joblib import load as joblib_load
 
-app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})  # allow Vite (5173) and others
+# =========================
+# Config / Globals
+# =========================
 
-# -----------------------------
-# Heuristics & helpers
-# -----------------------------
-URL_RE = re.compile(r"(https?://|www\.)\S+", re.IGNORECASE)
+MODEL = None
+# REMOVED THRESHOLD - using natural decision boundary instead
 
-PROMO_WORDS = {
-    "discount", "promo", "promotion", "sale", "buy now", "free", "voucher", "coupon",
-    "offer", "limited time", "deal", "code", "subscribe", "visit", "shop", "click",
+# Map model class names -> UI policy labels
+CLASS_TO_UI = {
+    "advertisement": "Advertisement",
+    "feedback": "Clean Review", 
+    "irrelevant": "Irrelevant",
+    "rant": "Rant (no visit)",
 }
-IRRELEVANT_MARKERS = {
-    "placeholder", "testing", "test review",
-    "not about this place", "unrelated",
-}
-NEG_WORDS = {
-    "terrible", "awful", "horrible", "worst", "hate", "disgusting", "angry", "bad",
-    "poor", "rude", "dirty", "unacceptable", "disappointing", "never", "insulting",
-}
-POS_WORDS = {
-    "amazing", "great", "good", "excellent", "wonderful", "friendly", "clean", "nice",
-    "tasty", "delicious", "love", "fast", "helpful",
-}
-DOMAIN_WORDS = {
-    "food", "restaurant", "menu", "service", "staff", "price", "location", "queue",
-    "cleanliness", "room", "table", "wait", "ambience", "drink", "bar", "coffee",
-    "hotel", "store", "cashier", "counter", "dish", "portion"
-}
-RANT_NO_VISIT_PATTERNS = [
-    r"\bnever been (here|there)\b",
-    r"\bhaven't been\b",
-    r"\bnot been\b",
-    r"\bi heard\b",
-    r"\bpeople say\b",
-]
+UI_LABELS = ["Advertisement", "Irrelevant", "Rant (no visit)", "Clean Review"]
 
-def _sentiment_score(text: str) -> float:
-    t = text.lower()
-    pos = sum(t.count(w) for w in POS_WORDS)
-    neg = sum(t.count(w) for w in NEG_WORDS)
-    if pos == 0 and neg == 0:
-        return 0.0
-    return (pos - neg) / max(1, (pos + neg))
+# Define which classes are violations
+VIOLATION_CLASSES = {"advertisement", "irrelevant", "rant"}
 
-def _relevancy_score(text: str, place: str | None) -> float:
-    t = text.lower()
-    score = 0.0
-    if place and place.strip():
-        if place.lower().strip() in t:
-            score += 0.4
-    hits = sum(1 for w in DOMAIN_WORDS if w in t)
-    if hits > 0:
-        score += min(0.6, math.log(1 + hits) / 2.0)
-    return round(max(0.0, min(1.0, score)), 2)
+LOAD_ERROR: Optional[str] = None
+CANDIDATE_STATUS: List[tuple] = []
 
-def _advertisement_flags(text: str, ev: list[str], flags: list[str]):
-    t = text.lower()
-    has_url = bool(URL_RE.search(text))
-    has_promo = any(p in t for p in PROMO_WORDS)
-    if has_url or has_promo:
-        flags.append("Advertisement")
-        if has_url: ev.append("Link detected")
-        if has_promo: ev.append("Promotional keywords detected")
+# =========================
+# Model loading
+# =========================
 
-def _irrelevant_flags(text: str, ev: list[str], flags: list[str]):
-    t = text.lower()
-    short = len(t.split()) < 8
-    has_irrel_marker = any(m in t for m in IRRELEVANT_MARKERS)
-    if has_irrel_marker or short:
-        flags.append("Irrelevant")
-        if has_irrel_marker: ev.append("Irrelevant marker text detected")
-        if short: ev.append("Very short review (low information)")
+def _candidate_model_paths():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.environ.get("MODEL_PATH")
+    
+    paths = []
+    if env_path:
+        paths.append(env_path)
+    
+    for name in ["rf_model_pipeline.joblib", "model.joblib"]:
+        paths.append(os.path.join(base_dir, name))
+        paths.append(os.path.join(os.getcwd(), name))
+    
+    return paths
 
-def _rant_no_visit_flags(text: str, ev: list[str], flags: list[str]):
-    t = text.lower()
-    neg = _sentiment_score(t)
-    mentions_no_visit = any(re.search(p, t) for p in RANT_NO_VISIT_PATTERNS)
-    very_negative = neg < -0.4
-    if mentions_no_visit:
-        flags.append("Rant (no visit)")
-        ev.append("Mentions having not visited")
-    domain_hits = sum(1 for w in DOMAIN_WORDS if w in t)
-    if very_negative and domain_hits == 0 and len(t.split()) > 5:
-        if "Rant (no visit)" not in flags:
-            flags.append("Rant")
-        ev.append("Excessive negative sentiment with little detail")
+def _load_model():
+    global MODEL, LOAD_ERROR, CANDIDATE_STATUS
+    LOAD_ERROR = None
+    CANDIDATE_STATUS = []
+    
+    for path in _candidate_model_paths():
+        exists = os.path.exists(path)
+        CANDIDATE_STATUS.append((path, exists))
+        
+        if not exists:
+            continue
+            
+        try:
+            MODEL = joblib_load(path)
+            if not isinstance(MODEL, dict) or "model" not in MODEL or "vectorizer" not in MODEL:
+                raise ValueError("Expected dict with 'model' and 'vectorizer' keys")
+            print(f"[app] Loaded model from: {path}")
+            return
+        except Exception as e:
+            LOAD_ERROR = str(e)
+            continue
+    
+    print(f"[app] Model load failed: {LOAD_ERROR}")
 
-def _quality_score(text: str, flags: list[str]) -> float:
-    score = 1.0
-    if "Advertisement" in flags: score -= 0.25
-    if "Irrelevant" in flags: score -= 0.35
-    if "Rant" in flags or "Rant (no visit)" in flags: score -= 0.25
-    if len(flags) >= 2: score -= 0.1
-    if URL_RE.search(text): score -= 0.15
-    return round(max(0.0, min(1.0, score)), 2)
+_load_model()
 
-def analyze_one(text: str, place: str | None, user: str | None, timestamp: str | None, rid: int) -> dict:
-    text = (text or "").strip()
-    place = (place or "Unknown Place").strip()
-    user = (user or "Anonymous").strip()
-    timestamp = (timestamp or "N/A").strip()
+# =========================
+# Core prediction (natural decision boundary - matches notebook exactly)
+# =========================
 
-    ev, flags = [], []
-    _advertisement_flags(text, ev, flags)
-    _irrelevant_flags(text, ev, flags)
-    _rant_no_visit_flags(text, ev, flags)
-
-    rel = _relevancy_score(text, place)
-    qual = _quality_score(text, flags)
-    snippet = (text[:120] + "…") if len(text) > 120 else text
-
+def predict_usage(text: str) -> Dict:
+    """Prediction using natural decision boundary (exactly like notebook)"""
+    if MODEL is None:
+        raise ValueError("Model not loaded")
+    
+    # Get components (exactly like notebook)
+    vectorizer = MODEL["vectorizer"]
+    model = MODEL["model"]
+    
+    # Transform and predict (exactly like notebook)
+    X = vectorizer.transform([text])
+    prediction = model.predict(X)[0]  # Natural decision boundary - highest prob wins
+    probabilities = model.predict_proba(X)[0]
+    
+    # Get class names
+    classes = list(model.classes_)
+    
+    # Build response
+    probs_dict = {classes[i]: float(probabilities[i]) for i in range(len(classes))}
+    top_prob = float(max(probabilities))
+    
     return {
-        "id": rid,
-        "place": place,
-        "user": user,
-        "snippet": snippet,
-        "fullText": text,
-        "relevancy": rel,
-        "qualityScore": qual,
-        "flags": flags,
-        "timestamp": timestamp,
-        "evidence": ev,
+        "label": prediction,
+        "probs": probs_dict,
+        "topProb": top_prob
     }
 
-def _pick_column(df: pd.DataFrame, *candidates: str) -> str | None:
+# =========================
+# Web app helpers
+# =========================
+
+def _normalize_to_ui_label(cls_name: str) -> str:
+    return CLASS_TO_UI.get(cls_name.lower(), cls_name)
+
+def _analyze_review(text: str, place: Optional[str] = None, user: Optional[str] = None,
+                   timestamp: Optional[str] = None, rid: int = 1):
+    """Analyze review using natural decision boundary (like notebook)"""
+    text = (text or "").strip()
+    if not text:
+        return None, jsonify({"error": "Empty text"}), 400
+    
+    try:
+        # Get prediction using natural decision boundary
+        result = predict_usage(text)
+        predicted_class = result["label"]  # Winner-takes-all
+        model_probs = result["probs"]
+        top_prob = result["topProb"]
+    except Exception as e:
+        return None, jsonify({"error": f"Prediction failed: {e}"}), 500
+    
+    # Map to UI labels
+    probs_ui = {ui: 0.0 for ui in UI_LABELS}
+    for model_class, prob in model_probs.items():
+        ui_label = _normalize_to_ui_label(model_class)
+        if ui_label in probs_ui:
+            probs_ui[ui_label] = float(prob)
+    
+    # Natural decision boundary: flag if predicted class is a violation
+    if predicted_class.lower() in VIOLATION_CLASSES:
+        predicted_ui_label = _normalize_to_ui_label(predicted_class)
+        flags = [predicted_ui_label]
+    else:
+        flags = []
+    
+    # Calculate metrics based on probabilities
+    violation_probs = {
+        "Advertisement": probs_ui.get("Advertisement", 0.0),
+        "Irrelevant": probs_ui.get("Irrelevant", 0.0),
+        "Rant (no visit)": probs_ui.get("Rant (no visit)", 0.0),
+    }
+    
+    clean_prob = probs_ui.get("Clean Review", 0.0)
+    
+    # Quality score: if clean review predicted, use that prob; else 1 - max violation prob
+    if predicted_class.lower() == "feedback":  # Clean review
+        quality_score = round(clean_prob, 2)
+    else:
+        max_violation_prob = max(violation_probs.values())
+        quality_score = round(max(0.0, 1.0 - max_violation_prob), 2)
+    
+    # Relevancy: 1 - irrelevant probability
+    relevancy = round(max(0.0, 1.0 - violation_probs.get("Irrelevant", 0.0)), 2)
+    
+    # Evidence showing all class probabilities
+    evidence = [f"{cls}: {prob:.2f}" for cls, prob in model_probs.items()]
+    
+    snippet = (text[:120] + "…") if len(text) > 120 else text
+    
+    result = {
+        "id": rid,
+        "place": place or "Unknown Place",
+        "user": user or "Anonymous",
+        "snippet": snippet,
+        "fullText": text,
+        "timestamp": timestamp or "N/A",
+        "relevancy": relevancy,
+        "qualityScore": quality_score,
+        "prediction_confidence": round(top_prob, 2),
+        "flags": flags,  # Based on natural decision boundary
+        "evidence": evidence,
+        "probs": probs_ui,
+        "predicted_class": predicted_class,  # Added for debugging
+    }
+    
+    return result, None, None
+
+def _pick_column(df: pd.DataFrame, *candidates: str) -> Optional[str]:
     lookup = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c in lookup:
-            return lookup[c]
+    for candidate in candidates:
+        if candidate.lower() in lookup:
+            return lookup[candidate.lower()]
     return None
 
-# -----------------------------
-# Routes
-# -----------------------------
+# =========================
+# Flask app + routes
+# =========================
+
+app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+def _ensure_model_or_500():
+    if MODEL is None:
+        return jsonify({
+            "error": "ML model not loaded. Check MODEL_PATH or place rf_model_pipeline.joblib next to app.py.",
+            "checked_paths": [{"path": p, "exists": ex} for p, ex in CANDIDATE_STATUS],
+            "last_error": LOAD_ERROR
+        }), 500
+    return None
+
 @app.get("/api/ping")
 def ping():
-    return jsonify({"ok": True, "ts": int(time.time())})
+    err = _ensure_model_or_500()
+    if err is not None:
+        return err
+    
+    return jsonify({
+        "ok": True,
+        "timestamp": int(time.time()),
+        "model_loaded": MODEL is not None,
+        "decision_method": "natural_boundary"  # No threshold!
+    })
+
+@app.get("/api/debug_model")
+def debug_model():
+    return jsonify({
+        "paths_checked": [{"path": p, "exists": ex} for p, ex in CANDIDATE_STATUS],
+        "last_error": LOAD_ERROR,
+        "current_dir": os.getcwd(),
+        "app_dir": os.path.dirname(os.path.abspath(__file__)),
+        "model_loaded": MODEL is not None,
+        "decision_method": "natural_boundary"
+    })
+
+@app.post("/api/predict")
+def api_predict_simple():
+    """Simple prediction endpoint (notebook-style usage)"""
+    err = _ensure_model_or_500()
+    if err is not None:
+        return err
+    
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    
+    if not text:
+        return jsonify({"error": "Provide non-empty 'text' field"}), 400
+    
+    try:
+        result = predict_usage(text)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.post("/api/analyze_text")
 def analyze_text():
+    """Analyze single text review (webapp format with natural decision boundary)"""
+    err = _ensure_model_or_500()
+    if err is not None:
+        return err
+    
     data = request.get_json(silent=True) or {}
     text = data.get("text", "")
     place = data.get("place")
-    user = data.get("user")
-    ts = data.get("timestamp")
+    user = data.get("user") 
+    timestamp = data.get("timestamp")
+    
     if not isinstance(text, str) or not text.strip():
-        return jsonify({"error": "Provide a non-empty 'text' field"}), 400
-    res = analyze_one(text, place, user, ts, rid=1)
-    return jsonify({"results": [res]})
+        return jsonify({"error": "Provide non-empty 'text' field"}), 400
+    
+    result, error_response, error_code = _analyze_review(text, place, user, timestamp, 1)
+    if error_response is not None:
+        return error_response, error_code
+    
+    return jsonify({"results": [result]})
 
 @app.post("/api/analyze_file")
 def analyze_file():
+    """Analyze CSV/Excel file with multiple reviews using natural decision boundary"""
+    err = _ensure_model_or_500()
+    if err is not None:
+        return err
+    
     if "file" not in request.files:
         return jsonify({"error": "Upload a file under form field 'file'"}), 400
-    f = request.files["file"]
-    content = f.read()
-
-    # Optional column hints
+    
+    file = request.files["file"]
+    content = file.read()
+    
+    # Get column mappings
     text_column = request.form.get("text_column")
-    place_column = request.form.get("place_column")
+    place_column = request.form.get("place_column") 
     user_column = request.form.get("user_column")
     timestamp_column = request.form.get("timestamp_column")
-
-    # Try CSV then Excel
+    
+    # Parse file
     try:
         df = pd.read_csv(io.BytesIO(content))
     except Exception:
         try:
-            df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
+            df = pd.read_excel(io.BytesIO(content))
         except Exception as e:
-            return jsonify({"error": f"Failed to parse file as CSV or Excel: {e}"}), 400
-
+            return jsonify({"error": f"Failed to parse file: {e}"}), 400
+    
     # Auto-detect columns
-    text_col = text_column or _pick_column(df, "review", "text", "content", "comments", "comment", "body")
-    place_col = place_column or _pick_column(df, "place", "location", "business", "venue", "poi")
+    text_col = text_column or _pick_column(df, "review", "text", "content", "comment", "body")
+    place_col = place_column or _pick_column(df, "place", "location", "business", "venue")
     user_col = user_column or _pick_column(df, "user", "author", "reviewer", "name")
-    ts_col = timestamp_column or _pick_column(df, "timestamp", "time", "date")
-
+    timestamp_col = timestamp_column or _pick_column(df, "timestamp", "time", "date")
+    
     if not text_col:
-        for c in df.columns:
-            if df[c].dtype == object:
-                text_col = c
+        for col in df.columns:
+            if df[col].dtype == object:
+                text_col = col
                 break
+    
     if not text_col:
-        return jsonify({"error": "No suitable text column found. Provide 'text_column' in form."}), 400
-
+        return jsonify({"error": "No suitable text column found"}), 400
+    
+    # Process reviews
     results = []
     rid = 1
+    
     for _, row in df.iterrows():
-        text = str(row.get(text_col, "") or "")
-        if not text.strip():
+        text = str(row.get(text_col, "") or "").strip()
+        if not text:
             continue
+            
         place = str(row.get(place_col, "") or "") if place_col else None
         user = str(row.get(user_col, "") or "") if user_col else None
-        ts = str(row.get(ts_col, "") or "") if ts_col else None
-        results.append(analyze_one(text, place, user, ts, rid))
+        timestamp = str(row.get(timestamp_col, "") or "") if timestamp_col else None
+        
+        result, error_response, error_code = _analyze_review(text, place, user, timestamp, rid)
+        if error_response is not None:
+            return error_response, error_code
+            
+        results.append(result)
         rid += 1
-
+    
     return jsonify({"results": results})
 
 if __name__ == "__main__":
-    # Run on port 8000 to match previous snippets
     app.run(host="0.0.0.0", port=8000, debug=True)
